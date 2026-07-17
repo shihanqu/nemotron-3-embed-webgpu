@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tsbuildinfo
+models/*.gguf
+models/*.wgpack
+bench-results/
+.DS_Store

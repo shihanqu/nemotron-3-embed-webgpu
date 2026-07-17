@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="590" viewBox="0 0 940 590" role="img" aria-labelledby="title desc">
+  <title id="title">Single-stream throughput (requests/second)</title>
+  <desc id="desc">Horizontal bars compare warmed single-stream requests per second for LM Studio and the custom WebGPU runtime at six exact token counts.</desc>
+  <rect width="940" height="590" fill="#0d1117"/>
+  <style>
+    .heading { font: 600 24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #f0f6fc; }
+    .subheading { font: 600 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #f0f6fc; }
+    .label, .row-label, .value, .tick, .caption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #b1bac4; }
+    .row-label { font-size: 14px; font-weight: 600; }
+    .value { font-size: 13px; font-weight: 600; }
+    .tick, .caption { font-size: 13px; }
+    .grid { stroke: #30363d; stroke-width: 1; }
+    .lm { fill: #8b949e; }
+    .gpu { fill: #58a6ff; }
+  </style>
+  <text x="42" y="45" class="heading" text-anchor="start">Nemotron 3 Embed 1B Q4 · WebGPU vs LM Studio</text>
+  <text x="42" y="73" class="caption" text-anchor="start">Apple M3 Max, 30 core GPU</text>
+  <text x="120" y="108" class="subheading" text-anchor="start">Single-stream throughput (requests/second)</text>
+  <line x1="120" y1="126" x2="120" y2="486" class="grid"/><text x="120" y="513" class="tick" text-anchor="middle">0</text><line x1="300" y1="126" x2="300" y2="486" class="grid"/><text x="300" y="513" class="tick" text-anchor="middle">15</text><line x1="480" y1="126" x2="480" y2="486" class="grid"/><text x="480" y="513" class="tick" text-anchor="middle">30</text><line x1="660" y1="126" x2="660" y2="486" class="grid"/><text x="660" y="513" class="tick" text-anchor="middle">45</text><line x1="840" y1="126" x2="840" y2="486" class="grid"/><text x="840" y="513" class="tick" text-anchor="middle">60</text>
+  <text x="102" y="164" class="row-label" text-anchor="end">15 tok</text>
+      <rect x="120" y="130" width="537.9766325851341" height="20" rx="4" class="lm"/>
+      <rect x="120" y="155" width="607.3335526225777" height="20" rx="4" class="gpu"/>
+      <text x="665.9766325851341" y="145" class="value" text-anchor="start">44.83</text>
+      <text x="735.3335526225777" y="170" class="value" text-anchor="start">50.61</text><text x="102" y="222" class="row-label" text-anchor="end">50 tok</text>
+      <rect x="120" y="188" width="383.6442019730202" height="20" rx="4" class="lm"/>
+      <rect x="120" y="213" width="393.64912744496746" height="20" rx="4" class="gpu"/>
+      <text x="511.6442019730202" y="203" class="value" text-anchor="start">31.97</text>
+      <text x="521.6491274449675" y="228" class="value" text-anchor="start">32.80</text><text x="102" y="280" class="row-label" text-anchor="end">150 tok</text>
+      <rect x="120" y="246" width="199.08784585291724" height="20" rx="4" class="lm"/>
+      <rect x="120" y="271" width="209.8599185035233" height="20" rx="4" class="gpu"/>
+      <text x="327.0878458529172" y="261" class="value" text-anchor="start">16.59</text>
+      <text x="337.8599185035233" y="286" class="value" text-anchor="start">17.49</text><text x="102" y="338" class="row-label" text-anchor="end">500 tok</text>
+      <rect x="120" y="304" width="68.97305794336165" height="20" rx="4" class="lm"/>
+      <rect x="120" y="329" width="69.41391517657857" height="20" rx="4" class="gpu"/>
+      <text x="196.97305794336165" y="319" class="value" text-anchor="start">5.75</text>
+      <text x="197.41391517657857" y="344" class="value" text-anchor="start">5.78</text><text x="102" y="396" class="row-label" text-anchor="end">1,500 tok</text>
+      <rect x="120" y="362" width="19.944261605887846" height="20" rx="4" class="lm"/>
+      <rect x="120" y="387" width="20.772806088783142" height="20" rx="4" class="gpu"/>
+      <text x="147.94426160588785" y="377" class="value" text-anchor="start">1.66</text>
+      <text x="148.77280608878314" y="402" class="value" text-anchor="start">1.73</text><text x="102" y="454" class="row-label" text-anchor="end">5,000 tok</text>
+      <rect x="120" y="420" width="5.317536360270065" height="20" rx="4" class="lm"/>
+      <rect x="120" y="445" width="6.091633395283192" height="20" rx="4" class="gpu"/>
+      <text x="133.31753636027008" y="435" class="value" text-anchor="start">0.44</text>
+      <text x="134.0916333952832" y="460" class="value" text-anchor="start">0.51</text>
+  <rect x="120" y="535" width="16" height="16" rx="3" class="lm"/><text x="144" y="548" class="caption" text-anchor="start">LM Studio</text>
+  <rect x="260" y="535" width="16" height="16" rx="3" class="gpu"/><text x="284" y="548" class="caption" text-anchor="start">Custom WebGPU</text>
+  <text x="42" y="577" class="caption" text-anchor="start">Measured 2026-07-17; exact token counts include BOS; warmed, isolated conditions.</text>
+</svg>
