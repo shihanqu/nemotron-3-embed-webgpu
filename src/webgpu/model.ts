@@ -10,6 +10,7 @@ import {
   MistralRopeKernel,
   RmsNormKernel,
   SwiGLUKernel,
+  TokenMergeKernel,
   encodeRun,
   type AttentionRun,
   type EncodableRun,
@@ -21,8 +22,14 @@ const Q_WIDTH = 3072;
 const KV_WIDTH = 1024;
 const QKV_WIDTH = Q_WIDTH + KV_WIDTH * 2;
 const LAYERS = 16;
+const TOKEN_SAMPLE_RATIO = 0.64;
+const MERGE_AFTER_LAYER = 4;
 const EPSILON = 1e-5;
 const ROPE_THETA = 1_000_000;
+
+export function contextualMergedLength(sequence: number): number {
+  return Math.max(1, Math.ceil(sequence * TOKEN_SAMPLE_RATIO));
+}
 
 interface LayerRuns {
   qkv: QuantMatmulRun;
@@ -51,36 +58,46 @@ function isPrepackedModel(model: GGUFModel | PrepackedModel): model is Prepacked
 export class NemotronExecutionPlan {
   readonly ownedBuffers: GPUBuffer[] = [];
   readonly tokenIds: GPUBuffer;
+  readonly sourceLengths: GPUBuffer;
   readonly lengths: GPUBuffer;
   readonly embeddings: GPUBuffer;
   readonly readback: GPUBuffer;
   readonly initialEmbedding: EncodableRun;
   readonly initialNorm: EncodableRun;
+  readonly mergeResidual: EncodableRun;
+  readonly mergeNormalized: EncodableRun;
   readonly layers: LayerRuns[] = [];
   readonly pool: EncodableRun;
+  readonly sequence: number;
 
-  constructor(readonly model: NemotronWebGPUModel, readonly batch: number, readonly sequence: number) {
+  constructor(readonly model: NemotronWebGPUModel, readonly batch: number, readonly inputSequence: number) {
     const { device } = model;
+    this.sequence = contextualMergedLength(inputSequence);
+    const sequence = this.sequence;
+    const inputTokens = batch * inputSequence;
     const tokens = batch * sequence;
     const activation=(elements:number,label:string,f32=false)=>{const buffer=activationBuffer(device,elements,label,f32);this.ownedBuffers.push(buffer);return buffer;};
-    this.tokenIds = activation(tokens * 2, 'token ids'); // u32: f16 helper sizing => tokens*4 bytes
+    this.tokenIds = activation(inputTokens * 2, 'token ids'); // u32: f16 helper sizing => tokens*4 bytes
+    this.sourceLengths = activation(batch * 2, 'source sequence lengths');
     this.lengths = activation(batch * 2, 'sequence lengths');
-    const x = activation(tokens * HIDDEN, 'residual stream');
-    const noResidual = activation(tokens * HIDDEN, 'unused residual');
-    const normalized = activation(tokens * HIDDEN, 'normalized hidden state');
-    const qkvRaw = activation(tokens * QKV_WIDTH, 'query + key + value raw');
-    const q = activation(tokens * Q_WIDTH, 'query rope');
-    const k = activation(tokens * KV_WIDTH, 'key rope');
-    const attention = activation(tokens * Q_WIDTH, 'attention');
-    const delta = activation(tokens * HIDDEN, 'residual delta');
-    const gateUp = activation(tokens * INTERMEDIATE * 2, 'FFN gate + up');
-    const ffn = activation(tokens * INTERMEDIATE, 'SwiGLU output');
-    const ropeValues = new Float32Array(sequence * 64 * 2);
+    const xFull = activation(inputTokens * HIDDEN, 'full residual stream');
+    const normalizedFull = activation(inputTokens * HIDDEN, 'full normalized hidden state');
+    const xReduced = activation(tokens * HIDDEN, 'merged residual stream');
+    const normalizedReduced = activation(tokens * HIDDEN, 'merged normalized hidden state');
+    const noResidual = activation(inputTokens * HIDDEN, 'unused residual');
+    const qkvRaw = activation(inputTokens * QKV_WIDTH, 'query + key + value raw');
+    const q = activation(inputTokens * Q_WIDTH, 'query rope');
+    const k = activation(inputTokens * KV_WIDTH, 'key rope');
+    const attention = activation(inputTokens * Q_WIDTH, 'attention');
+    const delta = activation(inputTokens * HIDDEN, 'residual delta');
+    const gateUp = activation(inputTokens * INTERMEDIATE * 2, 'FFN gate + up');
+    const ffn = activation(inputTokens * INTERMEDIATE, 'SwiGLU output');
+    const ropeValues = new Float32Array(inputSequence * 64 * 2);
     const frequencyScale = 1 / 16;
     const correction = (beta:number) => 128 * Math.log(16384 / (beta * 2 * Math.PI)) / (2 * Math.log(ROPE_THETA));
     const correctionLow = Math.floor(correction(32));
     const correctionHigh = Math.ceil(correction(1));
-    for (let position = 0; position < sequence; position += 1) for (let dimension = 0; dimension < 64; dimension += 1) {
+    for (let position = 0; position < inputSequence; position += 1) for (let dimension = 0; dimension < 64; dimension += 1) {
       const ramp = 1 - Math.min(1, Math.max(0, (dimension - correctionLow) / Math.max(0.001, correctionHigh - correctionLow)));
       const frequency = frequencyScale * (1 - ramp) + ramp;
       const angle = position * Math.pow(ROPE_THETA, -dimension / 64) * frequency;
@@ -93,24 +110,32 @@ export class NemotronExecutionPlan {
     this.readback = device.createBuffer({ size: batch * HIDDEN * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, label: 'embedding readback' });
     this.ownedBuffers.push(this.readback);
 
-    this.initialEmbedding = model.embedding.createRun(this.tokenIds, model.weight('token_embd.weight'), x, tokens, HIDDEN);
-    this.initialNorm = model.rmsNorm.createRun(x, noResidual, model.weight('blk.0.attn_norm.weight'), normalized, tokens, HIDDEN, EPSILON, false);
+    this.initialEmbedding = model.embedding.createRun(this.tokenIds, model.weight('token_embd.weight'), xFull, inputTokens, HIDDEN);
+    this.initialNorm = model.rmsNorm.createRun(xFull, noResidual, model.weight('blk.0.attn_norm.weight'), normalizedFull, inputTokens, HIDDEN, EPSILON, false);
+    this.mergeResidual = model.tokenMerge.createRun(xFull, this.sourceLengths, this.lengths, xReduced, batch, inputSequence, sequence, HIDDEN);
+    this.mergeNormalized = model.tokenMerge.createRun(normalizedFull, this.sourceLengths, this.lengths, normalizedReduced, batch, inputSequence, sequence, HIDDEN);
 
     for (let layer = 0; layer < LAYERS; layer += 1) {
       const prefix = `blk.${layer}`;
-      const qkvRun = model.matmul(normalized, `${prefix}.attn_qkv.weight`, tokens, qkvRaw);
-      const qkRope = model.rope.createRun(qkvRaw, q, k, tokens, sequence, ropeTable, QKV_WIDTH, 24, 8);
-      const attentionRun = model.attention.createRun(q, k, qkvRaw, attention, this.lengths, batch, sequence, 24, 8, QKV_WIDTH, Q_WIDTH + KV_WIDTH);
-      const attentionOutput = model.matmul(attention, `${prefix}.attn_output.weight`, tokens, delta);
-      const postAttentionNorm = model.rmsNorm.createRun(x, delta, model.weight(`${prefix}.ffn_norm.weight`), normalized, tokens, HIDDEN, EPSILON, true);
-      const gateUpRun = model.matmul(normalized, `${prefix}.ffn_gate_up.weight`, tokens, gateUp);
-      const swiglu = model.swiglu.createRun(gateUp, ffn, tokens, INTERMEDIATE);
+      const fullSequence = layer < MERGE_AFTER_LAYER;
+      const layerTokens = fullSequence ? inputTokens : tokens;
+      const layerSequence = fullSequence ? inputSequence : sequence;
+      const layerLengths = fullSequence ? this.sourceLengths : this.lengths;
+      const x = fullSequence ? xFull : xReduced;
+      const normalized = fullSequence ? normalizedFull : normalizedReduced;
+      const qkvRun = model.matmul(normalized, `${prefix}.attn_qkv.weight`, layerTokens, qkvRaw);
+      const qkRope = model.rope.createRun(qkvRaw, q, k, layerTokens, layerSequence, ropeTable, QKV_WIDTH, 24, 8);
+      const attentionRun = model.attention.createRun(q, k, qkvRaw, attention, layerLengths, batch, layerSequence, 24, 8, QKV_WIDTH, Q_WIDTH + KV_WIDTH);
+      const attentionOutput = model.matmul(attention, `${prefix}.attn_output.weight`, layerTokens, delta);
+      const postAttentionNorm = model.rmsNorm.createRun(x, delta, model.weight(`${prefix}.ffn_norm.weight`), normalized, layerTokens, HIDDEN, EPSILON, true);
+      const gateUpRun = model.matmul(normalized, `${prefix}.ffn_gate_up.weight`, layerTokens, gateUp);
+      const swiglu = model.swiglu.createRun(gateUp, ffn, layerTokens, INTERMEDIATE);
       const nextNormName = layer + 1 < LAYERS ? `blk.${layer + 1}.attn_norm.weight` : 'output_norm.weight';
-      const downRun = model.matmul(ffn, `${prefix}.ffn_down.weight`, tokens, delta);
-      const postFfnNorm = model.rmsNorm.createRun(x, delta, model.weight(nextNormName), normalized, tokens, HIDDEN, EPSILON, true);
+      const downRun = model.matmul(ffn, `${prefix}.ffn_down.weight`, layerTokens, delta);
+      const postFfnNorm = model.rmsNorm.createRun(x, delta, model.weight(nextNormName), normalized, layerTokens, HIDDEN, EPSILON, true);
       this.layers.push({ qkv: qkvRun, qkRope, attention: attentionRun, attentionOutput, postAttentionNorm, gateUp: gateUpRun, swiglu, down: downRun, postFfnNorm });
     }
-    this.pool = model.pool.createRun(normalized, this.lengths, this.embeddings, batch, sequence, HIDDEN);
+    this.pool = model.pool.createRun(normalizedReduced, this.lengths, this.embeddings, batch, sequence, HIDDEN);
   }
 
   destroy():void{
@@ -119,14 +144,18 @@ export class NemotronExecutionPlan {
   }
 
   async run(ids: Uint32Array, sequenceLengths: Uint32Array): Promise<Float32Array[]> {
-    if (ids.length !== this.batch * this.sequence) throw new Error('token buffer does not match execution plan');
+    if (ids.length !== this.batch * this.inputSequence) throw new Error('token buffer does not match execution plan');
+    const targetLengths = this.targetLengths(sequenceLengths);
     this.model.device.queue.writeBuffer(this.tokenIds, 0, ids.buffer as ArrayBuffer, ids.byteOffset, ids.byteLength);
-    this.model.device.queue.writeBuffer(this.lengths, 0, sequenceLengths.buffer as ArrayBuffer, sequenceLengths.byteOffset, sequenceLengths.byteLength);
+    this.model.device.queue.writeBuffer(this.sourceLengths, 0, sequenceLengths.buffer as ArrayBuffer, sequenceLengths.byteOffset, sequenceLengths.byteLength);
+    this.model.device.queue.writeBuffer(this.lengths, 0, targetLengths.buffer as ArrayBuffer, targetLengths.byteOffset, targetLengths.byteLength);
     const encoder = this.model.device.createCommandEncoder({ label: `Nemotron batch=${this.batch} sequence=${this.sequence}` });
     const pass = encoder.beginComputePass();
     encodeRun(pass, this.initialEmbedding);
     encodeRun(pass, this.initialNorm);
-    for (const layer of this.layers) {
+    for (let layerIndex = 0; layerIndex < this.layers.length; layerIndex += 1) {
+      if (layerIndex === MERGE_AFTER_LAYER) { encodeRun(pass, this.mergeResidual); encodeRun(pass, this.mergeNormalized); }
+      const layer = this.layers[layerIndex];
       this.model.kernelFor(layer.qkv).encode(pass, layer.qkv);
       encodeRun(pass, layer.qkRope); this.model.attention.encode(pass, layer.attention);
       this.model.kernelFor(layer.attentionOutput).encode(pass, layer.attentionOutput);
@@ -148,9 +177,12 @@ export class NemotronExecutionPlan {
 
   async profile(ids: Uint32Array, sequenceLengths: Uint32Array): Promise<Record<string, number>> {
     if (!this.model.device.features.has('timestamp-query')) throw new Error('timestamp-query is unavailable');
+    if (ids.length !== this.batch * this.inputSequence) throw new Error('token buffer does not match execution plan');
+    const targetLengths = this.targetLengths(sequenceLengths);
     this.model.device.queue.writeBuffer(this.tokenIds, 0, ids.buffer as ArrayBuffer, ids.byteOffset, ids.byteLength);
-    this.model.device.queue.writeBuffer(this.lengths, 0, sequenceLengths.buffer as ArrayBuffer, sequenceLengths.byteOffset, sequenceLengths.byteLength);
-    const stageCount = 2 + this.layers.length * 8;
+    this.model.device.queue.writeBuffer(this.sourceLengths, 0, sequenceLengths.buffer as ArrayBuffer, sequenceLengths.byteOffset, sequenceLengths.byteLength);
+    this.model.device.queue.writeBuffer(this.lengths, 0, targetLengths.buffer as ArrayBuffer, targetLengths.byteOffset, targetLengths.byteLength);
+    const stageCount = 3 + this.layers.length * 8;
     const querySet = this.model.device.createQuerySet({ type: 'timestamp', count: stageCount * 2 });
     const queryBytes = stageCount * 16;
     const resolve = this.model.device.createBuffer({ size: queryBytes, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
@@ -164,7 +196,9 @@ export class NemotronExecutionPlan {
       encode(pass); pass.end();
     };
     stage('embedding_norm', (pass) => { encodeRun(pass, this.initialEmbedding); encodeRun(pass, this.initialNorm); });
-    for (const layer of this.layers) {
+    for (let layerIndex = 0; layerIndex < this.layers.length; layerIndex += 1) {
+      if (layerIndex === MERGE_AFTER_LAYER) stage('token_merge', (pass) => { encodeRun(pass, this.mergeResidual); encodeRun(pass, this.mergeNormalized); });
+      const layer = this.layers[layerIndex];
       stage('qkv', (pass) => this.model.kernelFor(layer.qkv).encode(pass, layer.qkv));
       stage('rope_attention', (pass) => { encodeRun(pass, layer.qkRope); this.model.attention.encode(pass, layer.attention); });
       stage('attention_output', (pass) => this.model.kernelFor(layer.attentionOutput).encode(pass, layer.attentionOutput));
@@ -188,6 +222,15 @@ export class NemotronExecutionPlan {
     readback.destroy(); resolve.destroy(); querySet.destroy();
     return totals;
   }
+
+  private targetLengths(sequenceLengths: Uint32Array): Uint32Array {
+    const targetLengths = new Uint32Array(this.batch);
+    for (let batch = 0; batch < this.batch; batch += 1) {
+      const sourceLength = Math.min(this.inputSequence, sequenceLengths[batch]);
+      targetLengths[batch] = Math.min(this.sequence, contextualMergedLength(sourceLength));
+    }
+    return targetLengths;
+  }
 }
 
 export class NemotronWebGPUModel {
@@ -204,6 +247,7 @@ export class NemotronWebGPUModel {
   readonly attention: BidirectionalAttentionKernel;
   readonly pool: MeanPoolKernel;
   readonly embedding: EmbeddingLookupKernel;
+  readonly tokenMerge: TokenMergeKernel;
   readonly prepackedNames = new Set<string>();
 
   constructor(readonly device: GPUDevice, source: GGUFModel | PrepackedModel) {
@@ -215,6 +259,7 @@ export class NemotronWebGPUModel {
     this.rmsNorm = new RmsNormKernel(device); this.swiglu = new SwiGLUKernel(device);
     this.rope = new MistralRopeKernel(device); this.attention = new BidirectionalAttentionKernel(device);
     this.pool = new MeanPoolKernel(device); this.embedding = new EmbeddingLookupKernel(device);
+    this.tokenMerge = new TokenMergeKernel(device);
     if (isPrepackedModel(source)) {
       for (const tensor of source.tensors.values()) {
         const bytes = new Uint8Array(source.buffer, tensor.byteOffset, tensor.byteLength);
@@ -275,7 +320,7 @@ export class NemotronWebGPUModel {
   }
 
   kernelFor(run: QuantMatmulRun): QuantMatmulKernel {
-    if(run.pipeline===this.q40Prepacked.latencyPipeline||run.pipeline===this.q40Prepacked.throughputPipeline||run.pipeline===this.q40Prepacked.midBatchPipeline||run.pipeline===this.q40Prepacked.batchPipeline||run.pipeline===this.q40Prepacked.subgroupPipeline)return this.q40Prepacked;
+    if(run.pipeline===this.q40Prepacked.latencyPipeline||run.pipeline===this.q40Prepacked.throughputPipeline||run.pipeline===this.q40Prepacked.midBatchPipeline||run.pipeline===this.q40Prepacked.batchPipeline||run.pipeline===this.q40Prepacked.subgroupPipeline||run.pipeline===this.q40Prepacked.compactSubgroup16Pipeline)return this.q40Prepacked;
     if(run.pipeline===this.q40.latencyPipeline||run.pipeline===this.q40.throughputPipeline||run.pipeline===this.q40.midBatchPipeline||run.pipeline===this.q40.batchPipeline)return this.q40;
     return run.pipeline === this.q4.latencyPipeline || run.pipeline === this.q4.throughputPipeline || run.pipeline === this.q4.midBatchPipeline || run.pipeline === this.q4.batchPipeline ? this.q4 : this.q6;
   }

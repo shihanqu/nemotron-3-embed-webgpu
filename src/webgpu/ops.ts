@@ -626,6 +626,57 @@ export class MeanPoolKernel {
   }
 }
 
+const tokenMergeShader = /* wgsl */`
+enable f16;
+struct Params { input_sequence:u32, output_sequence:u32, vectors_per_token:u32, dispatch_width:u32 }
+@group(0) @binding(0) var<storage,read> input:array<vec4<f16>>;
+@group(0) @binding(1) var<storage,read> source_lengths:array<u32>;
+@group(0) @binding(2) var<storage,read> target_lengths:array<u32>;
+@group(0) @binding(3) var<storage,read_write> output:array<vec4<f16>>;
+@group(0) @binding(4) var<uniform> params:Params;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_id) local:vec3<u32>){
+  let vector_index=(group.y*params.dispatch_width+group.x)*256u+local.x;
+  let output_tokens=arrayLength(&output)/params.vectors_per_token;
+  if(vector_index>=output_tokens*params.vectors_per_token){return;}
+  let output_token=vector_index/params.vectors_per_token;
+  let vector=vector_index%params.vectors_per_token;
+  let batch=output_token/params.output_sequence;
+  let position=output_token%params.output_sequence;
+  let source_length=source_lengths[batch];let target_length=target_lengths[batch];
+  if(position>=target_length){output[vector_index]=vec4<f16>(0.0);return;}
+  var start=0u;var end=1u;
+  if(position>0u&&target_length>1u){
+    let source_tail=source_length-1u;let target_tail=target_length-1u;
+    start=1u+((position-1u)*source_tail)/target_tail;
+    end=1u+(position*source_tail)/target_tail;
+    end=max(end,start+1u);end=min(end,source_length);
+  }
+  var total=vec4<f32>(0.0);
+  for(var source_position=start;source_position<end;source_position+=1u){
+    total+=vec4<f32>(input[((batch*params.input_sequence+source_position)*params.vectors_per_token)+vector]);
+  }
+  output[vector_index]=vec4<f16>(total/f32(end-start));
+}
+`;
+
+export class TokenMergeKernel {
+  readonly pipeline:GPUComputePipeline;
+  constructor(readonly device:GPUDevice){
+    this.pipeline=device.createComputePipeline({layout:'auto',compute:{module:device.createShaderModule({code:tokenMergeShader}),entryPoint:'main'},label:'content-preserving token merge'});
+  }
+  createRun(input:GPUBuffer,sourceLengths:GPUBuffer,targetLengths:GPUBuffer,output:GPUBuffer,batch:number,inputSequence:number,outputSequence:number,width=2048):EncodableRun{
+    const vectorsPerToken=width/4;
+    const groups=Math.ceil(batch*outputSequence*vectorsPerToken/256);
+    const dispatchWidth=Math.min(groups,this.device.limits.maxComputeWorkgroupsPerDimension);
+    const params=createBufferWithData(this.device,new Uint32Array([inputSequence,outputSequence,vectorsPerToken,dispatchWidth]),GPUBufferUsage.UNIFORM);
+    return {pipeline:this.pipeline,bindGroup:this.device.createBindGroup({layout:this.pipeline.getBindGroupLayout(0),entries:[
+      {binding:0,resource:{buffer:input}},{binding:1,resource:{buffer:sourceLengths}},{binding:2,resource:{buffer:targetLengths}},
+      {binding:3,resource:{buffer:output}},{binding:4,resource:{buffer:params}},
+    ]}),dispatch:[dispatchWidth,Math.ceil(groups/dispatchWidth)]};
+  }
+}
+
 const embeddingShader = /* wgsl */`
 enable f16;
 struct Params { tokens: u32, width: u32, blocks_per_row: u32, _pad: u32 }

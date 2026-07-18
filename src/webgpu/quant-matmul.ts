@@ -376,15 +376,32 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(subgroup_invocation_id
 `;
 }
 
-function createCompactSubgroupShaderMain(): string {
-  const sumDeclarations = Array.from({ length: SUBGROUP_ROWS }, (_, row) => `var sum${row}=f16(0.0);`).join('\n  ');
-  const lowAccumulations = Array.from({ length: SUBGROUP_ROWS }, (_, row) => `sum${row}+=dot(subgroupBroadcast(own_activation_low,${row}u),weight_low);`).join('\n    ');
-  const highAccumulations = Array.from({ length: SUBGROUP_ROWS }, (_, row) => `sum${row}+=dot(subgroupBroadcast(own_activation_high,${row}u),weight_high);`).join('\n    ');
-  const stores = Array.from({ length: SUBGROUP_ROWS }, (_, row) => `if(m_base+${row}u<params.m){output[(m_base+${row}u)*params.n+n]=sum${row};}`).join('\n    ');
+function createCompactSubgroupShaderMain(rowsPerGroup: 16 | 32 | 64): string {
+  const activationGroups = Math.ceil(rowsPerGroup / 32);
+  const sumDeclarations = Array.from({ length: rowsPerGroup }, (_, row) => `var sum${row}=f16(0.0);`).join('\n  ');
+  const activationDeclarations = Array.from({ length: activationGroups }, (_, group) =>
+    `var own_activation_low${group}=vec4<f16>(0.0);var own_activation_high${group}=vec4<f16>(0.0);`,
+  ).join('\n      ');
+  const activationLoads = Array.from({ length: activationGroups }, (_, group) => {
+    const rowOffset = group * 32;
+    return `if(m_base+${rowOffset}u+lane<params.m){
+        own_activation_low${group}=input[((m_base+${rowOffset}u+lane)*params.k+column_low)/4u];
+        own_activation_high${group}=input[((m_base+${rowOffset}u+lane)*params.k+column_high)/4u];
+      }`;
+  }).join('\n      ');
+  const lowAccumulations = Array.from({ length: rowsPerGroup }, (_, row) => {
+    const group = Math.floor(row / 32);
+    return `sum${row}+=dot(subgroupBroadcast(own_activation_low${group},${row % 32}u),weight_low);`;
+  }).join('\n      ');
+  const highAccumulations = Array.from({ length: rowsPerGroup }, (_, row) => {
+    const group = Math.floor(row / 32);
+    return `sum${row}+=dot(subgroupBroadcast(own_activation_high${group},${row % 32}u),weight_high);`;
+  }).join('\n      ');
+  const stores = Array.from({ length: rowsPerGroup }, (_, row) => `if(m_base+${row}u<params.m){output[(m_base+${row}u)*params.n+n]=sum${row};}`).join('\n    ');
   return /* wgsl */`
 @compute @workgroup_size(32)
 fn main(@builtin(workgroup_id) group: vec3<u32>,@builtin(subgroup_invocation_id) lane:u32){
-  let n=group.x*32u+lane;let m_base=group.y*${SUBGROUP_ROWS}u;
+  let n=group.x*32u+lane;let m_base=group.y*${rowsPerGroup}u;
   ${sumDeclarations}
   for(var k_block=0u;k_block<params.blocks_per_row;k_block+=1u){
     let record=((group.x*params.blocks_per_row+k_block)*32u+lane)*5u;
@@ -394,11 +411,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,@builtin(subgroup_invocation_id)
       let weight_low=vec4<f16>(scale)*(vec4<f16>(packed&vec4<u32>(15u))-vec4<f16>(8.0));
       let weight_high=vec4<f16>(scale)*(vec4<f16>(packed>>vec4<u32>(4u))-vec4<f16>(8.0));
       let column_low=k_block*32u+word*4u;let column_high=column_low+16u;
-      var own_activation_low=vec4<f16>(0.0);var own_activation_high=vec4<f16>(0.0);
-      if(lane<${SUBGROUP_ROWS}u&&m_base+lane<params.m){
-        own_activation_low=input[((m_base+lane)*params.k+column_low)/4u];
-        own_activation_high=input[((m_base+lane)*params.k+column_high)/4u];
-      }
+      ${activationDeclarations}
+      ${activationLoads}
       ${lowAccumulations}
       ${highAccumulations}
     }
@@ -427,6 +441,7 @@ export class QuantMatmulKernel {
   readonly midBatchPipeline: GPUComputePipeline;
   readonly batchPipeline: GPUComputePipeline;
   readonly subgroupPipeline: GPUComputePipeline;
+  readonly compactSubgroup16Pipeline: GPUComputePipeline;
 
   constructor(readonly device: GPUDevice, readonly type: GGMLType.Q4_0 | GGMLType.Q4_K | GGMLType.Q6_K, readonly layout: QuantWeightLayout = 'gguf') {
     if (layout === 'q4_0-tile32-compact' && type !== GGMLType.Q4_0) throw new Error('prepacked tile32 layout only supports Q4_0 sources');
@@ -434,15 +449,16 @@ export class QuantMatmulKernel {
     this.throughputPipeline = this.createPipeline(64, 'throughput', layout === 'q4_0-tile32-compact', layout === 'q4_0-tile32-compact');
     this.midBatchPipeline = this.createMidBatchPipeline();
     this.batchPipeline = this.createBatchPipeline();
-    this.subgroupPipeline = this.createSubgroupPipeline();
+    this.subgroupPipeline = this.createSubgroupPipeline(32);
+    this.compactSubgroup16Pipeline = layout === 'q4_0-tile32-compact' ? this.createSubgroupPipeline(16) : this.subgroupPipeline;
   }
 
-  private createSubgroupPipeline(): GPUComputePipeline {
+  private createSubgroupPipeline(rowsPerGroup: 16 | 32): GPUComputePipeline {
     const code=this.layout==='q4_0-tile32-compact'
-      ? this.shaderPrelude()+createCompactSubgroupShaderMain()
+      ? this.shaderPrelude()+createCompactSubgroupShaderMain(rowsPerGroup)
       : this.shaderPrelude()+this.dequantShader()+createSubgroupShaderMain();
-    const module=this.device.createShaderModule({code,label:'prepacked subgroup matmul shader'});
-    return this.device.createComputePipeline({layout:'auto',compute:{module,entryPoint:'main'},label:'prepacked subgroup matmul'});
+    const module=this.device.createShaderModule({code,label:`prepacked subgroup-${rowsPerGroup} matmul shader`});
+    return this.device.createComputePipeline({layout:'auto',compute:{module,entryPoint:'main'},label:`prepacked subgroup-${rowsPerGroup} matmul`});
   }
 
   private createMidBatchPipeline(): GPUComputePipeline {
@@ -505,8 +521,10 @@ export class QuantMatmulKernel {
       GPUBufferUsage.UNIFORM,
       'matmul params',
     );
-    const compactSubgroup = this.layout === 'q4_0-tile32-compact' && m >= 32;
-    const pipeline = compactSubgroup ? this.subgroupPipeline : m >= 512 ? this.batchPipeline : m >= 256 ? this.midBatchPipeline : m >= 16 ? this.throughputPipeline : this.latencyPipeline;
+    const compactSubgroup = this.layout === 'q4_0-tile32-compact';
+    const pipeline = compactSubgroup
+      ? m <= 32 && n >= 4096 ? this.compactSubgroup16Pipeline : m <= 16 ? this.latencyPipeline : m <= 32 ? this.throughputPipeline : this.subgroupPipeline
+      : m >= 512 ? this.batchPipeline : m >= 256 ? this.midBatchPipeline : m >= 16 ? this.throughputPipeline : this.latencyPipeline;
     const bindGroup = this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: [
@@ -524,8 +542,12 @@ export class QuantMatmulKernel {
     pass.setBindGroup(0, run.bindGroup);
     const batch = run.pipeline === this.batchPipeline;
     const midBatch = run.pipeline === this.midBatchPipeline;
+    if (run.pipeline === this.compactSubgroup16Pipeline) {
+      pass.dispatchWorkgroups(Math.ceil(run.n / 32), Math.ceil(run.m / 16));
+      return;
+    }
     if (run.pipeline === this.subgroupPipeline) {
-      pass.dispatchWorkgroups(Math.ceil(run.n / 32), Math.ceil(run.m / SUBGROUP_ROWS));
+      pass.dispatchWorkgroups(Math.ceil(run.n / 32), Math.ceil(run.m / 32));
       return;
     }
     pass.dispatchWorkgroups(Math.ceil(run.n / (batch || midBatch ? 32 : TILE_N)), Math.ceil(run.m / (batch ? 32 : TILE_M)));

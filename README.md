@@ -12,16 +12,16 @@ The charts compare the custom WebGPU runtime with the raw LM Studio endpoint usi
 
 | Input | LM Studio single | WebGPU single | LM Studio 16× | WebGPU 16× | LM cosine |
 |---:|---:|---:|---:|---:|---:|
-| 15 tokens | 44.83 req/s | **50.61 req/s** | 50.53 req/s | **192.30 req/s** | 0.9723 |
-| 50 tokens | 31.97 req/s | **32.80 req/s** | 34.97 req/s | **55.93 req/s** | 0.9775 |
-| 150 tokens | 16.59 req/s | **17.49 req/s** | 17.38 req/s | **23.02 req/s** | 0.9783 |
-| 500 tokens | 5.75 req/s | **5.78 req/s** | 5.75 req/s | **6.51 req/s** | 0.9774 |
-| 1,500 tokens | 1.66 req/s | **1.73 req/s** | 1.54 req/s | **1.80 req/s** | 0.9773 |
-| 5,000 tokens | 0.44 req/s | **0.51 req/s** | 0.44 req/s | **0.46 req/s** | 0.9773 |
+| 15 tokens | 44.83 req/s | **69.68 req/s** | 50.53 req/s | **266.02 req/s** | 0.9690 |
+| 50 tokens | 31.97 req/s | **48.80 req/s** | 34.97 req/s | **93.89 req/s** | 0.9769 |
+| 150 tokens | 16.59 req/s | **24.03 req/s** | 17.38 req/s | **32.55 req/s** | 0.9788 |
+| 500 tokens | 5.75 req/s | **8.18 req/s** | 5.75 req/s | **9.50 req/s** | 0.9775 |
+| 1,500 tokens | 1.66 req/s | **2.56 req/s** | 1.54 req/s | **2.75 req/s** | 0.9773 |
+| 5,000 tokens | 0.44 req/s | **0.76 req/s** | 0.44 req/s | **0.72 req/s** | 0.9773 |
 
 Test hardware: Apple M3 Max, 30 core GPU.
 
-Inputs through 2,048 tokens use full bidirectional attention. Above 2,048 tokens, the long-context kernel uniformly samples every third key/value token. This is an intentional approximation; at 5,000 tokens its measured cosine agreement with LM Studio is `0.977289`. Native-batch agreement with the single-request WebGPU output is at least `0.999920` across the published matrix.
+All tokens enter the encoder and the first four layers run at the original sequence length. The runtime then merges adjacent contextual hidden states to 64% of the original length, preserves BOS, and runs the remaining twelve layers on that representation. Merged sequences through 2,048 states use full bidirectional attention; above that, the long-context kernel uniformly samples every third key/value state. These are intentional approximations. Cosine agreement with LM Studio is `0.9330` for a natural 17-token sentence, `0.9285` for varied 96-token prose, and `0.9773` for the deterministic 5,000-token fixture. Native-batch agreement with the single-request WebGPU output is at least `0.999908` across the published matrix.
 
 GPU performance is sensitive to thermals. Run long rows separately and allow the GPU to cool before collecting another row. The complete measurements and methodology are in [`docs/benchmarks/2026-07-17-webgpu-vs-lm-studio-m3-max.json`](docs/benchmarks/2026-07-17-webgpu-vs-lm-studio-m3-max.json).
 
@@ -77,9 +77,11 @@ The offline converter and runtime are specialized for Nemotron’s 16-layer, 2,0
 - Q, K, and V are fused into one projection per layer; FFN gate and up projections are fused as well.
 - Q4_K and Q6_K projection tensors are requantized offline to Q4_0 and rearranged into aligned 32-row GPU tiles.
 - A subgroup matmul kernel broadcasts activations across 32 rows so each quantized weight block serves many requests or tokens.
+- A 16-row subgroup path reduces wasted work for short, high-output projection matrices.
 - Separate 16-row and 64-row bidirectional FlashAttention-style kernels cover short and long sequence regimes.
 - QK dot products and value accumulation use FP16 while online softmax maxima and denominators stay FP32.
 - RoPE uses a portable two-dimensional dispatch, avoiding WebGPU’s 65,535-workgroup limit on long native batches.
+- After four full-context encoder layers, a GPU token-merge kernel bins adjacent contextual states to 64% of the original sequence length while preserving BOS; all sixteen layers still run.
 - Residual addition plus RMSNorm, SwiGLU, mean pooling, L2 normalization, and storage-aware concurrent scheduling have dedicated kernels.
 
 The resulting `.wgpack` is self-contained and 765,745,152 bytes (730.3 MiB), about 2.2% larger than the 714.6 MiB source GGUF. Startup requires no matrix concatenation, requantization, or tensor repacking in the browser.
