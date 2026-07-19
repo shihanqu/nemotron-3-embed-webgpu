@@ -2,6 +2,8 @@
 
 A browser-native Q4 runtime for NVIDIA Nemotron 3 Embed 1B. It loads one self-contained `.wgpack`, runs custom WGSL kernels, and micro-batches up to 16 simultaneous embedding requests.
 
+> **LM Studio users — set the domain override first.** LM Studio (through 0.4.19) categorizes the GGUF build of this model as a text-generation LLM rather than an embedding model: its domain detection matches on the GGUF architecture name (`mistral3`) and ignores the `pooling_type` and `attention.causal` metadata the file already carries. Until this is fixed upstream ([lmstudio-ai/lmstudio-bug-tracker#2177](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/2177)), open **My Models → Nemotron 3 Embed 1B → Domain Control → Override Domain Type → "Text Embedding"** after downloading. Without the override the model will not serve `/v1/embeddings` correctly — it either refuses the request or returns 1,024-dimensional vectors that are **not valid embeddings** of the input, where this model's true output is 2,048-dimensional. Every LM Studio figure below assumes the override is set.
+
 ## Performance
 
 The charts compare the custom WebGPU runtime with the raw LM Studio endpoint using identical text and exact tokenizer lengths. LM Studio runs the Q4_K_M file [`nemotron-3-embed-1b-q4_k_m.gguf`](https://huggingface.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF/blob/06df1fde6f7009c91f6cc3cd520081921929a678/nemotron-3-embed-1b-q4_k_m.gguf), SHA-256 `9a74166f51dbc280073748fa199bea49283bd21f7f9280f2dec2b4d975ddfd1d`. This is the same source GGUF used to build the WebGPU pack. Model loading is excluded. Each WebGPU row is warmed and measured as an isolated condition; the published LM Studio values are the fastest repeated endpoint result for each row.
@@ -88,7 +90,7 @@ The resulting `.wgpack` is self-contained and 765,745,152 bytes (730.3 MiB), abo
 
 ## Reproduce the comparison
 
-Start LM Studio’s local server with the linked [`nemotron-3-embed-1b-q4_k_m.gguf`](https://huggingface.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF/blob/06df1fde6f7009c91f6cc3cd520081921929a678/nemotron-3-embed-1b-q4_k_m.gguf) loaded as `text-embedding-nemotron-3-embed-1b` at `http://127.0.0.1:1234`, then start this app.
+Start LM Studio’s local server with the linked [`nemotron-3-embed-1b-q4_k_m.gguf`](https://huggingface.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF/blob/06df1fde6f7009c91f6cc3cd520081921929a678/nemotron-3-embed-1b-q4_k_m.gguf) loaded as `text-embedding-nemotron-3-embed-1b` at `http://127.0.0.1:1234`, then start this app. That model id only exists once the domain override described at the top of this README is applied; without it LM Studio lists the model as `nemotron-3-embed-1b` and the comparison rows will fail or report meaningless cosine agreement.
 
 Run a WebGPU row in the browser:
 
