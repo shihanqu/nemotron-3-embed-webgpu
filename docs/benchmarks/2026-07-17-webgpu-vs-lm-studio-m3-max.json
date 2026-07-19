@@ -7,7 +7,9 @@
     "webgpu": "Chromium WebGPU with shader-f16, subgroups, and timestamp-query",
     "webgpuModel": "nemotron-3-embed-1b-q4-webgpu.wgpack (WGPACK02)",
     "node": "24.x",
-    "lmStudioModel": "text-embedding-nemotron-3-embed-1b"
+    "lmStudioModel": "text-embedding-nemotron-3-embed-1b",
+    "lmStudioGguf": "https://huggingface.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF/blob/06df1fde6f7009c91f6cc3cd520081921929a678/nemotron-3-embed-1b-q4_k_m.gguf",
+    "lmStudioGgufSha256": "9a74166f51dbc280073748fa199bea49283bd21f7f9280f2dec2b4d975ddfd1d"
   },
   "method": {
     "tokenCountsIncludeBos": true,

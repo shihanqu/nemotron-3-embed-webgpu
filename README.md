@@ -4,7 +4,7 @@ A browser-native Q4 runtime for NVIDIA Nemotron 3 Embed 1B. It loads one self-co
 
 ## Performance
 
-The charts compare the custom WebGPU runtime with the raw LM Studio endpoint using identical text and exact tokenizer lengths. Model loading is excluded. Each WebGPU row is warmed and measured as an isolated condition; the published LM Studio values are the fastest repeated endpoint result for each row.
+The charts compare the custom WebGPU runtime with the raw LM Studio endpoint using identical text and exact tokenizer lengths. LM Studio runs the Q4_K_M file [`nemotron-3-embed-1b-q4_k_m.gguf`](https://huggingface.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF/blob/06df1fde6f7009c91f6cc3cd520081921929a678/nemotron-3-embed-1b-q4_k_m.gguf), SHA-256 `9a74166f51dbc280073748fa199bea49283bd21f7f9280f2dec2b4d975ddfd1d`. This is the same source GGUF used to build the WebGPU pack. Model loading is excluded. Each WebGPU row is warmed and measured as an isolated condition; the published LM Studio values are the fastest repeated endpoint result for each row.
 
 ![Single-stream throughput for Nemotron 3 Embed 1B WebGPU and LM Studio](docs/single-stream-comparison.svg)
 
@@ -35,7 +35,7 @@ Normal use requires only this release asset:
 
 The app uses that GitHub Release asset by default. It does not download or parse a GGUF at runtime. The tokenizer is loaded from [`nvidia/Nemotron-3-Embed-1B-BF16`](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16).
 
-The pack was built from [`zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF`](https://huggingface.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF), file `nemotron-3-embed-1b-q4_k_m.gguf`, SHA-256 `9a74166f51dbc280073748fa199bea49283bd21f7f9280f2dec2b4d975ddfd1d`.
+The pack was built from [`nemotron-3-embed-1b-q4_k_m.gguf`](https://huggingface.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF/blob/06df1fde6f7009c91f6cc3cd520081921929a678/nemotron-3-embed-1b-q4_k_m.gguf) in `zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF`, SHA-256 `9a74166f51dbc280073748fa199bea49283bd21f7f9280f2dec2b4d975ddfd1d`.
 
 ## Quick start
 
@@ -88,7 +88,7 @@ The resulting `.wgpack` is self-contained and 765,745,152 bytes (730.3 MiB), abo
 
 ## Reproduce the comparison
 
-Start LM Studio’s local server with `text-embedding-nemotron-3-embed-1b` loaded at `http://127.0.0.1:1234`, then start this app.
+Start LM Studio’s local server with the linked [`nemotron-3-embed-1b-q4_k_m.gguf`](https://huggingface.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF/blob/06df1fde6f7009c91f6cc3cd520081921929a678/nemotron-3-embed-1b-q4_k_m.gguf) loaded as `text-embedding-nemotron-3-embed-1b` at `http://127.0.0.1:1234`, then start this app.
 
 Run a WebGPU row in the browser:
 
