@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-22",
+  "testedHardware": "NVIDIA GeForce RTX 3070 Laptop GPU, 8 GiB",
+  "software": {
+    "os": "Windows x64",
+    "nvidiaDriver": "566.07",
+    "webgpu": "Chromium WebGPU with shader-f16, subgroups, and timestamp-query",
+    "webgpuModel": "nemotron-3-embed-1b-q4-webgpu.wgpack (WGPACK02)",
+    "lmStudioEndpoint": "http://127.0.0.1:1234/v1/embeddings",
+    "lmStudioModel": "text-embedding-nemotron-3-embed-1b",
+    "lmStudioGguf": "https://huggingface.co/zenmagnets/Nemotron-3-Embed-1B-Q4_K_M-GGUF/blob/06df1fde6f7009c91f6cc3cd520081921929a678/nemotron-3-embed-1b-q4_k_m.gguf",
+    "lmStudioGgufSha256": "9a74166f51dbc280073748fa199bea49283bd21f7f9280f2dec2b4d975ddfd1d",
+    "measurementCommit": "8e3c9cf217fff3f09dc45ba71dc98956a3789b77"
+  },
+  "method": {
+    "tokensIncludeBos": true,
+    "tokensPerRequest": 150,
+    "input": "149 repetitions of the single-token word vector, plus BOS",
+    "kernelProfile": "nvidia-rtx30 (global selector in the measurement commit)",
+    "executionProfile": "fast-150",
+    "webgpuUrl": "http://127.0.0.1:5173/?matrix=1&tokens=150&execution=fast-150&diagnostic=1",
+    "integrationUrl": "http://127.0.0.1:5173/?matrix=1&tokens=150&kernels=nvidia-rtx30&execution=fast-150&diagnostic=1",
+    "lmStudioDurationMs": 10000,
+    "lmStudioWarmupRequests": 5,
+    "modelLoadExcluded": true,
+    "errors": 0
+  },
+  "webgpu": {
+    "singleRps": 27.428446038519652,
+    "concurrency16AggregateRps": 65.65988178137648,
+    "scaling": 2.393860800176787,
+    "lmStudioCosine": 0.9729855723106355,
+    "worstBatchCosine": 1.0000000371206534,
+    "nativeBatch": 16
+  },
+  "lmStudio": {
+    "singleRps": 11.795656839151825,
+    "concurrency16AggregateRps": 14.67715597704482,
+    "singleRequests": 118,
+    "concurrency16Requests": 162,
+    "embeddingDimensions": 2048
+  },
+  "comparison": {
+    "singleSpeedup": 2.32530044002975,
+    "singlePercentFaster": 132.530044002975,
+    "concurrency16Speedup": 4.47361068343683,
+    "singleTarget": "at least 30 percent faster than LM Studio",
+    "concurrency16Target": "at least 3 times faster than LM Studio",
+    "targetsPassed": true
+  },
+  "qualityProfileCheck": {
+    "tokens": 145,
+    "description": "nine repetitions of a natural sentence",
+    "lmStudioCosine": 0.927560,
+    "note": "The default quality profile retains the original four full-context layers and 64 percent contextual merge."
+  }
+}

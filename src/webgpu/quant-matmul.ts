@@ -264,6 +264,59 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) l
 `;
 }
 
+function createCompactWideBatchShaderMain(): string {
+  const sumDeclarations = Array.from({ length: 8 }, (_, pair) => `var sums${pair}=vec4<f16>(0.0);`).join('');
+  const accumulations = Array.from({ length: 8 }, (_, pair) => {
+    const firstRow = pair * 32;
+    const secondRow = firstRow + 16;
+    return `let av${pair}a=tile_a[(local.y+${firstRow}u)*8u+k4];let av${pair}b=tile_a[(local.y+${secondRow}u)*8u+k4];
+      sums${pair}+=vec4<f16>(dot(av${pair}a,b0),dot(av${pair}a,b1),dot(av${pair}b,b0),dot(av${pair}b,b1));`;
+  }).join('\n      ');
+  const stores = Array.from({ length: 8 }, (_, pair) => {
+    const firstRow = pair * 32;
+    const secondRow = firstRow + 16;
+    return `let row${pair}a=m0+${firstRow}u;let row${pair}b=m0+${secondRow}u;
+  if(row${pair}a<params.m&&n0<params.n){output[row${pair}a*params.n+n0]=sums${pair}.x;}
+  if(row${pair}a<params.m&&n1<params.n){output[row${pair}a*params.n+n1]=sums${pair}.y;}
+  if(row${pair}b<params.m&&n0<params.n){output[row${pair}b*params.n+n0]=sums${pair}.z;}
+  if(row${pair}b<params.m&&n1<params.n){output[row${pair}b*params.n+n1]=sums${pair}.w;}`;
+  }).join('\n  ');
+  return /* wgsl */`
+var<workgroup> tile_a:array<vec4<f16>,2048>;
+var<workgroup> tile_w:array<vec4<f16>,256>;
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_id) local:vec3<u32>,@builtin(local_invocation_index) lane:u32){
+  let m0=group.y*256u+local.y;let n0=group.x*32u+local.x;let n1=n0+16u;
+  ${sumDeclarations}
+  for(var k_block=0u;k_block<params.blocks_per_row;k_block+=1u){
+    for(var index=lane;index<2304u;index+=256u){
+      let is_weight=index>=2048u;let tile_index=select(index,index-2048u,is_weight);let row=tile_index/8u;let vector=tile_index&7u;
+      if(is_weight){
+        let global_n=group.x*32u+row;let output_tile=global_n/32u;let local_row=global_n&31u;
+        let record=((output_tile*params.blocks_per_row+k_block)*32u+local_row)*5u;
+        let scale=f16(unpack2x16float(weights[record]).x);
+        let word=vector&3u;let packed=unpack4xU8(weights[record+1u+word]);
+        let quant=select(packed&vec4<u32>(15u),packed>>vec4<u32>(4u),vector>=4u);
+        tile_w[tile_index]=vec4<f16>(scale)*(vec4<f16>(quant)-vec4<f16>(8.0));
+      }else{
+        let global_m=group.y*256u+row;
+        if(global_m<params.m){tile_a[tile_index]=input[(global_m*params.k+k_block*32u+vector*4u)/4u];}
+        else{tile_a[tile_index]=vec4<f16>(0.0);}
+      }
+    }
+    workgroupBarrier();
+    let w0=local.x*8u;let w1=(local.x+16u)*8u;
+    for(var k4=0u;k4<8u;k4+=1u){
+      let b0=tile_w[w0+k4];let b1=tile_w[w1+k4];
+      ${accumulations}
+    }
+    workgroupBarrier();
+  }
+  ${stores}
+}
+`;
+}
+
 function createCompactBatchShaderMain(): string {
   return /* wgsl */`
 var<workgroup> tile_a:array<vec4<f16>,256>;
@@ -303,6 +356,94 @@ fn main(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_id) loc
   let rows=array<u32,4>(m0,m0+8u,m0+16u,m0+24u);let cols=array<u32,4>(n0,n0+8u,n0+16u,n0+24u);
   let all_sums=array<vec4<f16>,4>(sums0,sums1,sums2,sums3);
   for(var r=0u;r<4u;r+=1u){for(var c=0u;c<4u;c+=1u){if(rows[r]<params.m&&cols[c]<params.n){output[rows[r]*params.n+cols[c]]=all_sums[r][c];}}}
+}
+`;
+}
+
+function createCompactSmallBatchShaderMain(): string {
+  return /* wgsl */`
+var<workgroup> tile_a:array<vec4<f16>,512>;
+var<workgroup> tile_w:array<vec4<f16>,512>;
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_id) local:vec3<u32>,@builtin(local_invocation_index) lane:u32){
+  let m0=group.y*64u+local.y;let n0=group.x*64u+local.x;
+  var sums0=vec4<f16>(0.0);var sums1=vec4<f16>(0.0);var sums2=vec4<f16>(0.0);var sums3=vec4<f16>(0.0);
+  for(var k_block=0u;k_block<params.blocks_per_row;k_block+=1u){
+    for(var index=lane;index<1024u;index+=256u){
+      let is_weight=index>=512u;let tile_index=index&511u;let row=tile_index/8u;let vector=tile_index&7u;
+      if(is_weight){
+        let global_n=group.x*64u+row;let output_tile=global_n/32u;let local_row=global_n&31u;
+        let record=((output_tile*params.blocks_per_row+k_block)*32u+local_row)*5u;
+        let scale=f16(unpack2x16float(weights[record]).x);
+        let word=vector&3u;let packed=unpack4xU8(weights[record+1u+word]);
+        let quant=select(packed&vec4<u32>(15u),packed>>vec4<u32>(4u),vector>=4u);
+        tile_w[tile_index]=vec4<f16>(scale)*(vec4<f16>(quant)-vec4<f16>(8.0));
+      }else{
+        let global_m=group.y*64u+row;
+        if(global_m<params.m){tile_a[tile_index]=input[(global_m*params.k+k_block*32u+vector*4u)/4u];}
+        else{tile_a[tile_index]=vec4<f16>(0.0);}
+      }
+    }
+    workgroupBarrier();
+    let a0=local.y*8u;let a1=(local.y+16u)*8u;let a2=(local.y+32u)*8u;let a3=(local.y+48u)*8u;
+    let w0=local.x*8u;let w1=(local.x+16u)*8u;let w2=(local.x+32u)*8u;let w3=(local.x+48u)*8u;
+    for(var k4=0u;k4<8u;k4+=1u){
+      let b0=tile_w[w0+k4];let b1=tile_w[w1+k4];let b2=tile_w[w2+k4];let b3=tile_w[w3+k4];
+      let av0=tile_a[a0+k4];let av1=tile_a[a1+k4];let av2=tile_a[a2+k4];let av3=tile_a[a3+k4];
+      sums0+=vec4<f16>(dot(av0,b0),dot(av0,b1),dot(av0,b2),dot(av0,b3));
+      sums1+=vec4<f16>(dot(av1,b0),dot(av1,b1),dot(av1,b2),dot(av1,b3));
+      sums2+=vec4<f16>(dot(av2,b0),dot(av2,b1),dot(av2,b2),dot(av2,b3));
+      sums3+=vec4<f16>(dot(av3,b0),dot(av3,b1),dot(av3,b2),dot(av3,b3));
+    }
+    workgroupBarrier();
+  }
+  let rows=array<u32,4>(m0,m0+16u,m0+32u,m0+48u);let cols=array<u32,4>(n0,n0+16u,n0+32u,n0+48u);
+  let all_sums=array<vec4<f16>,4>(sums0,sums1,sums2,sums3);
+  for(var r=0u;r<4u;r+=1u){for(var c=0u;c<4u;c+=1u){if(rows[r]<params.m&&cols[c]<params.n){output[rows[r]*params.n+cols[c]]=all_sums[r][c];}}}
+}
+`;
+}
+
+function createCompactTinyBatchShaderMain(): string {
+  return /* wgsl */`
+var<workgroup> tile_a:array<vec4<f16>,256>;
+var<workgroup> tile_w:array<vec4<f16>,512>;
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_id) local:vec3<u32>,@builtin(local_invocation_index) lane:u32){
+  let m0=group.y*32u+local.y;let m1=m0+16u;let n0=group.x*64u+local.x;
+  var sums0=vec4<f16>(0.0);var sums1=vec4<f16>(0.0);
+  for(var k_block=0u;k_block<params.blocks_per_row;k_block+=1u){
+    for(var index=lane;index<768u;index+=256u){
+      let is_weight=index>=256u;let tile_index=select(index,index-256u,is_weight);let row=tile_index/8u;let vector=tile_index&7u;
+      if(is_weight){
+        let global_n=group.x*64u+row;let output_tile=global_n/32u;let local_row=global_n&31u;
+        let record=((output_tile*params.blocks_per_row+k_block)*32u+local_row)*5u;
+        let scale=f16(unpack2x16float(weights[record]).x);
+        let word=vector&3u;let packed=unpack4xU8(weights[record+1u+word]);
+        let quant=select(packed&vec4<u32>(15u),packed>>vec4<u32>(4u),vector>=4u);
+        tile_w[tile_index]=vec4<f16>(scale)*(vec4<f16>(quant)-vec4<f16>(8.0));
+      }else{
+        let global_m=group.y*32u+row;
+        if(global_m<params.m){tile_a[tile_index]=input[(global_m*params.k+k_block*32u+vector*4u)/4u];}
+        else{tile_a[tile_index]=vec4<f16>(0.0);}
+      }
+    }
+    workgroupBarrier();
+    let a0=local.y*8u;let a1=(local.y+16u)*8u;
+    let w0=local.x*8u;let w1=(local.x+16u)*8u;let w2=(local.x+32u)*8u;let w3=(local.x+48u)*8u;
+    for(var k4=0u;k4<8u;k4+=1u){
+      let b0=tile_w[w0+k4];let b1=tile_w[w1+k4];let b2=tile_w[w2+k4];let b3=tile_w[w3+k4];
+      let av0=tile_a[a0+k4];let av1=tile_a[a1+k4];
+      sums0+=vec4<f16>(dot(av0,b0),dot(av0,b1),dot(av0,b2),dot(av0,b3));
+      sums1+=vec4<f16>(dot(av1,b0),dot(av1,b1),dot(av1,b2),dot(av1,b3));
+    }
+    workgroupBarrier();
+  }
+  let cols=array<u32,4>(n0,n0+16u,n0+32u,n0+48u);
+  for(var c=0u;c<4u;c+=1u){
+    if(m0<params.m&&cols[c]<params.n){output[m0*params.n+cols[c]]=sums0[c];}
+    if(m1<params.m&&cols[c]<params.n){output[m1*params.n+cols[c]]=sums1[c];}
+  }
 }
 `;
 }
@@ -434,21 +575,63 @@ export interface QuantMatmulRun {
 }
 
 export type QuantWeightLayout = 'gguf' | 'q4_0-tile32-compact';
+export type CompactMatmulProfile = 'portable' | 'nvidia-rtx30';
+export type CompactMatmulPipelineKind =
+  | 'compact-subgroup-16'
+  | 'latency'
+  | 'throughput'
+  | 'subgroup'
+  | 'compact-tiny'
+  | 'compact-small'
+  | 'compact-wide';
+
+export function selectCompactMatmulPipeline(
+  m: number,
+  n: number,
+  profile: CompactMatmulProfile = 'portable',
+): CompactMatmulPipelineKind {
+  if (profile === 'portable') {
+    if (m <= 32 && n >= 4096) return 'compact-subgroup-16';
+    if (m <= 16) return 'latency';
+    if (m <= 32) return 'throughput';
+    return 'subgroup';
+  }
+  if (m <= 16 && n >= 4096) return 'compact-subgroup-16';
+  if (m <= 16) return 'latency';
+  if (m < 32 && n >= 4096) return 'compact-subgroup-16';
+  if (m < 32) return 'throughput';
+  if (m === 32) return 'compact-tiny';
+  if (m < 128) return 'compact-small';
+  return 'compact-wide';
+}
 
 export class QuantMatmulKernel {
   readonly latencyPipeline: GPUComputePipeline;
   readonly throughputPipeline: GPUComputePipeline;
   readonly midBatchPipeline: GPUComputePipeline;
   readonly batchPipeline: GPUComputePipeline;
+  readonly compactWideBatchPipeline?: GPUComputePipeline;
+  readonly compactSmallBatchPipeline?: GPUComputePipeline;
+  readonly compactTinyBatchPipeline?: GPUComputePipeline;
   readonly subgroupPipeline: GPUComputePipeline;
   readonly compactSubgroup16Pipeline: GPUComputePipeline;
 
-  constructor(readonly device: GPUDevice, readonly type: GGMLType.Q4_0 | GGMLType.Q4_K | GGMLType.Q6_K, readonly layout: QuantWeightLayout = 'gguf') {
+  constructor(
+    readonly device: GPUDevice,
+    readonly type: GGMLType.Q4_0 | GGMLType.Q4_K | GGMLType.Q6_K,
+    readonly layout: QuantWeightLayout = 'gguf',
+    readonly compactProfile: CompactMatmulProfile = 'portable',
+  ) {
     if (layout === 'q4_0-tile32-compact' && type !== GGMLType.Q4_0) throw new Error('prepacked tile32 layout only supports Q4_0 sources');
     this.latencyPipeline = this.createPipeline(128, 'latency');
     this.throughputPipeline = this.createPipeline(64, 'throughput', layout === 'q4_0-tile32-compact', layout === 'q4_0-tile32-compact');
     this.midBatchPipeline = this.createMidBatchPipeline();
     this.batchPipeline = this.createBatchPipeline();
+    if (layout === 'q4_0-tile32-compact' && compactProfile === 'nvidia-rtx30') {
+      this.compactWideBatchPipeline = this.createCompactWideBatchPipeline();
+      this.compactSmallBatchPipeline = this.createCompactSmallBatchPipeline();
+      this.compactTinyBatchPipeline = this.createCompactTinyBatchPipeline();
+    }
     this.subgroupPipeline = this.createSubgroupPipeline(32);
     this.compactSubgroup16Pipeline = layout === 'q4_0-tile32-compact' ? this.createSubgroupPipeline(16) : this.subgroupPipeline;
   }
@@ -477,6 +660,24 @@ export class QuantMatmulKernel {
     const quantName=this.type===GGMLType.Q4_0?'Q4_0':this.type===GGMLType.Q4_K?'Q4_K':'Q6_K';
     const module=this.device.createShaderModule({code,label:`${quantName} batch shader`});
     return this.device.createComputePipeline({layout:'auto',compute:{module,entryPoint:'main'},label:`${quantName} fused matmul (batch)`});
+  }
+
+  private createCompactWideBatchPipeline(): GPUComputePipeline {
+    const code=this.shaderPrelude()+createCompactWideBatchShaderMain();
+    const module=this.device.createShaderModule({code,label:'Q4_0 compact 256x32 matmul shader'});
+    return this.device.createComputePipeline({layout:'auto',compute:{module,entryPoint:'main'},label:'Q4_0 compact 256x32 matmul'});
+  }
+
+  private createCompactSmallBatchPipeline(): GPUComputePipeline {
+    const code=this.shaderPrelude()+createCompactSmallBatchShaderMain();
+    const module=this.device.createShaderModule({code,label:'Q4_0 compact 64x64 matmul shader'});
+    return this.device.createComputePipeline({layout:'auto',compute:{module,entryPoint:'main'},label:'Q4_0 compact 64x64 matmul'});
+  }
+
+  private createCompactTinyBatchPipeline(): GPUComputePipeline {
+    const code=this.shaderPrelude()+createCompactTinyBatchShaderMain();
+    const module=this.device.createShaderModule({code,label:'Q4_0 compact 32x64 matmul shader'});
+    return this.device.createComputePipeline({layout:'auto',compute:{module,entryPoint:'main'},label:'Q4_0 compact 32x64 matmul'});
   }
 
   private createPipeline(tileK: number, variant: string, halfAccumulation = false, fullOutputTiles = false): GPUComputePipeline {
@@ -521,9 +722,8 @@ export class QuantMatmulKernel {
       GPUBufferUsage.UNIFORM,
       'matmul params',
     );
-    const compactSubgroup = this.layout === 'q4_0-tile32-compact';
-    const pipeline = compactSubgroup
-      ? m <= 32 && n >= 4096 ? this.compactSubgroup16Pipeline : m <= 16 ? this.latencyPipeline : m <= 32 ? this.throughputPipeline : this.subgroupPipeline
+    const pipeline = this.layout === 'q4_0-tile32-compact'
+      ? this.compactPipeline(selectCompactMatmulPipeline(m, n, this.compactProfile))
       : m >= 512 ? this.batchPipeline : m >= 256 ? this.midBatchPipeline : m >= 16 ? this.throughputPipeline : this.latencyPipeline;
     const bindGroup = this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
@@ -550,7 +750,33 @@ export class QuantMatmulKernel {
       pass.dispatchWorkgroups(Math.ceil(run.n / 32), Math.ceil(run.m / 32));
       return;
     }
+    if (this.compactSmallBatchPipeline && run.pipeline === this.compactSmallBatchPipeline) {
+      pass.dispatchWorkgroups(Math.ceil(run.n / 64), Math.ceil(run.m / 64));
+      return;
+    }
+    if (this.compactTinyBatchPipeline && run.pipeline === this.compactTinyBatchPipeline) {
+      pass.dispatchWorkgroups(Math.ceil(run.n / 64), Math.ceil(run.m / 32));
+      return;
+    }
+    if (this.compactWideBatchPipeline && run.pipeline === this.compactWideBatchPipeline) {
+      pass.dispatchWorkgroups(Math.ceil(run.n / 32), Math.ceil(run.m / 256));
+      return;
+    }
     pass.dispatchWorkgroups(Math.ceil(run.n / (batch || midBatch ? 32 : TILE_N)), Math.ceil(run.m / (batch ? 32 : TILE_M)));
+  }
+
+  private compactPipeline(kind: CompactMatmulPipelineKind): GPUComputePipeline {
+    if (kind === 'compact-subgroup-16') return this.compactSubgroup16Pipeline;
+    if (kind === 'latency') return this.latencyPipeline;
+    if (kind === 'throughput') return this.throughputPipeline;
+    if (kind === 'subgroup') return this.subgroupPipeline;
+    const pipeline = kind === 'compact-tiny'
+      ? this.compactTinyBatchPipeline
+      : kind === 'compact-small'
+        ? this.compactSmallBatchPipeline
+        : this.compactWideBatchPipeline;
+    if (!pipeline) throw new Error(`compact matmul pipeline ${kind} requires the nvidia-rtx30 profile`);
+    return pipeline;
   }
 
   dispatch(run: QuantMatmulRun, repetitions = 1): void {
@@ -559,5 +785,19 @@ export class QuantMatmulKernel {
     for (let index = 0; index < repetitions; index += 1) this.encode(pass, run);
     pass.end();
     this.device.queue.submit([encoder.finish()]);
+  }
+
+  ownsPipeline(pipeline: GPUComputePipeline): boolean {
+    return [
+      this.latencyPipeline,
+      this.throughputPipeline,
+      this.midBatchPipeline,
+      this.batchPipeline,
+      this.compactWideBatchPipeline,
+      this.compactSmallBatchPipeline,
+      this.compactTinyBatchPipeline,
+      this.subgroupPipeline,
+      this.compactSubgroup16Pipeline,
+    ].includes(pipeline);
   }
 }

@@ -21,6 +21,21 @@ const data = JSON.parse(readFileSync(resolve('docs/benchmarks/2026-07-17-webgpu-
   naturalQuality: Array<{ lmStudioCosine: number }>;
   rows: BenchmarkRow[];
 };
+const windowsFast150 = JSON.parse(readFileSync(resolve('docs/benchmarks/2026-07-22-windows-rtx3070-fast150.json'), 'utf8')) as {
+  method: {
+    executionProfile: string;
+    integrationUrl: string;
+    kernelProfile: string;
+  };
+  webgpu: {
+    singleRps: number;
+    concurrency16AggregateRps: number;
+    lmStudioCosine: number;
+    worstBatchCosine: number;
+  };
+  lmStudio: { singleRps: number; concurrency16AggregateRps: number };
+  qualityProfileCheck: { lmStudioCosine: number };
+};
 
 describe('published benchmark matrix', () => {
   it('contains every required exact-token workload', () => {
@@ -44,5 +59,27 @@ describe('published benchmark matrix', () => {
     for (const fixture of data.naturalQuality) {
       expect(fixture.lmStudioCosine).toBeGreaterThanOrEqual(0.90);
     }
+  });
+});
+
+describe('Windows RTX 3070 fast-150 acceptance', () => {
+  it('records the explicit integration profiles', () => {
+    expect(windowsFast150.method.kernelProfile).toContain('nvidia-rtx30');
+    expect(windowsFast150.method.executionProfile).toBe('fast-150');
+    expect(windowsFast150.method.integrationUrl).toContain('kernels=nvidia-rtx30');
+    expect(windowsFast150.method.integrationUrl).toContain('execution=fast-150');
+  });
+
+  it('clears the requested LM Studio speedups and accuracy gates', () => {
+    expect(windowsFast150.webgpu.singleRps).toBeGreaterThanOrEqual(windowsFast150.lmStudio.singleRps * 1.3);
+    expect(windowsFast150.webgpu.concurrency16AggregateRps).toBeGreaterThanOrEqual(
+      windowsFast150.lmStudio.concurrency16AggregateRps * 3,
+    );
+    expect(windowsFast150.webgpu.lmStudioCosine).toBeGreaterThanOrEqual(0.90);
+    expect(windowsFast150.webgpu.worstBatchCosine).toBeGreaterThanOrEqual(0.999);
+  });
+
+  it('keeps the default profile above the natural-prose quality floor', () => {
+    expect(windowsFast150.qualityProfileCheck.lmStudioCosine).toBeGreaterThanOrEqual(0.90);
   });
 });

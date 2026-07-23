@@ -4,9 +4,9 @@ import { GGMLType, type GGUFModel } from './gguf/types.ts';
 import { toFloat16Bits } from './math/f16.ts';
 import { requestWebGPUDevice } from './webgpu/device.ts';
 import { NemotronEmbeddingEngine, type TokenizerLike } from './webgpu/embedding-engine.ts';
-import { QuantMatmulKernel } from './webgpu/quant-matmul.ts';
+import { QuantMatmulKernel, type CompactMatmulProfile } from './webgpu/quant-matmul.ts';
 import { CausalAttentionKernel, LastTokenPoolKernel, QKNormRopeKernel, RmsNormKernel, SwiGLUKernel } from './webgpu/ops.ts';
-import { NemotronWebGPUModel } from './webgpu/model.ts';
+import { NemotronWebGPUModel, type ExecutionProfile } from './webgpu/model.ts';
 import { COMPARISON_TOKEN_COUNTS, getComparisonWorkload, getWorkload } from '../scripts/workloads.ts';
 import { PREPACKED_STORAGE_COMPACT, parsePrepackedModel, type PrepackedModel } from './prepacked/format.ts';
 
@@ -42,6 +42,10 @@ runButton.addEventListener('click', async () => {
     write(`Features: ${Array.from(adapter.features).sort().join(', ')}`);
     write(`Storage binding limit: ${(device.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MiB`);
     const searchParams = new URLSearchParams(location.search);
+    const executionProfile: ExecutionProfile = searchParams.get('execution') === 'fast-150' ? 'fast-150' : 'quality';
+    const compactMatmulProfile: CompactMatmulProfile = searchParams.get('kernels') === 'nvidia-rtx30' ? 'nvidia-rtx30' : 'portable';
+    write(`Kernel profile: ${compactMatmulProfile}`);
+    write(`Execution profile: ${executionProfile}`);
     const q40 = true;
     const usePrepacked = !searchParams.has('gguf');
     const modelUrl = q40
@@ -157,7 +161,7 @@ runButton.addEventListener('click', async () => {
 
     write('Uploading all model tensors to the GPU…');
     device.pushErrorScope('validation');
-    const runtime = new NemotronWebGPUModel(device, prepacked ?? model!);
+    const runtime = new NemotronWebGPUModel(device, prepacked ?? model!, executionProfile, compactMatmulProfile);
     const uploadError = await device.popErrorScope();
     if (uploadError) throw new Error(`model upload validation: ${uploadError.message}`);
     write('Loading tokenizer…');

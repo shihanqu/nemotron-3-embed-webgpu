@@ -2,7 +2,11 @@ import type { GGUFModel, GGUFTensorInfo } from '../gguf/types.ts';
 import { GGMLType } from '../gguf/types.ts';
 import { createBufferWithData } from './device.ts';
 import { PREPACKED_STORAGE_COMPACT, type PrepackedModel } from '../prepacked/format.ts';
-import { QuantMatmulKernel, type QuantMatmulRun } from './quant-matmul.ts';
+import {
+  QuantMatmulKernel,
+  type CompactMatmulProfile,
+  type QuantMatmulRun,
+} from './quant-matmul.ts';
 import {
   BidirectionalAttentionKernel,
   EmbeddingLookupKernel,
@@ -22,13 +26,30 @@ const Q_WIDTH = 3072;
 const KV_WIDTH = 1024;
 const QKV_WIDTH = Q_WIDTH + KV_WIDTH * 2;
 const LAYERS = 16;
-const TOKEN_SAMPLE_RATIO = 0.64;
-const MERGE_AFTER_LAYER = 4;
+const DEFAULT_TOKEN_SAMPLE_RATIO = 0.64;
+const DEFAULT_MERGE_AFTER_LAYER = 4;
+const FAST_150_MIN_TOKENS = 128;
+const FAST_150_MAX_TOKENS = 192;
+const FAST_150_STATES = 32;
+const FAST_150_MERGE_AFTER_LAYER = 1;
 const EPSILON = 1e-5;
 const ROPE_THETA = 1_000_000;
 
-export function contextualMergedLength(sequence: number): number {
-  return Math.max(1, Math.ceil(sequence * TOKEN_SAMPLE_RATIO));
+export type ExecutionProfile = 'quality' | 'fast-150';
+
+function usesFast150Profile(sequence: number, profile: ExecutionProfile): boolean {
+  return profile === 'fast-150' && sequence >= FAST_150_MIN_TOKENS && sequence <= FAST_150_MAX_TOKENS;
+}
+
+export function contextualMergedLength(sequence: number, profile: ExecutionProfile = 'quality'): number {
+  if (usesFast150Profile(sequence, profile)) return FAST_150_STATES;
+  return Math.max(1, Math.ceil(sequence * DEFAULT_TOKEN_SAMPLE_RATIO));
+}
+
+export function contextualMergeAfterLayer(sequence: number, profile: ExecutionProfile = 'quality'): number {
+  return usesFast150Profile(sequence, profile)
+    ? FAST_150_MERGE_AFTER_LAYER
+    : DEFAULT_MERGE_AFTER_LAYER;
 }
 
 interface LayerRuns {
@@ -69,10 +90,12 @@ export class NemotronExecutionPlan {
   readonly layers: LayerRuns[] = [];
   readonly pool: EncodableRun;
   readonly sequence: number;
+  readonly mergeAfterLayer: number;
 
   constructor(readonly model: NemotronWebGPUModel, readonly batch: number, readonly inputSequence: number) {
     const { device } = model;
-    this.sequence = contextualMergedLength(inputSequence);
+    this.sequence = contextualMergedLength(inputSequence, model.executionProfile);
+    this.mergeAfterLayer = contextualMergeAfterLayer(inputSequence, model.executionProfile);
     const sequence = this.sequence;
     const inputTokens = batch * inputSequence;
     const tokens = batch * sequence;
@@ -117,7 +140,7 @@ export class NemotronExecutionPlan {
 
     for (let layer = 0; layer < LAYERS; layer += 1) {
       const prefix = `blk.${layer}`;
-      const fullSequence = layer < MERGE_AFTER_LAYER;
+      const fullSequence = layer < this.mergeAfterLayer;
       const layerTokens = fullSequence ? inputTokens : tokens;
       const layerSequence = fullSequence ? inputSequence : sequence;
       const layerLengths = fullSequence ? this.sourceLengths : this.lengths;
@@ -154,7 +177,7 @@ export class NemotronExecutionPlan {
     encodeRun(pass, this.initialEmbedding);
     encodeRun(pass, this.initialNorm);
     for (let layerIndex = 0; layerIndex < this.layers.length; layerIndex += 1) {
-      if (layerIndex === MERGE_AFTER_LAYER) { encodeRun(pass, this.mergeResidual); encodeRun(pass, this.mergeNormalized); }
+      if (layerIndex === this.mergeAfterLayer) { encodeRun(pass, this.mergeResidual); encodeRun(pass, this.mergeNormalized); }
       const layer = this.layers[layerIndex];
       this.model.kernelFor(layer.qkv).encode(pass, layer.qkv);
       encodeRun(pass, layer.qkRope); this.model.attention.encode(pass, layer.attention);
@@ -197,7 +220,7 @@ export class NemotronExecutionPlan {
     };
     stage('embedding_norm', (pass) => { encodeRun(pass, this.initialEmbedding); encodeRun(pass, this.initialNorm); });
     for (let layerIndex = 0; layerIndex < this.layers.length; layerIndex += 1) {
-      if (layerIndex === MERGE_AFTER_LAYER) stage('token_merge', (pass) => { encodeRun(pass, this.mergeResidual); encodeRun(pass, this.mergeNormalized); });
+      if (layerIndex === this.mergeAfterLayer) stage('token_merge', (pass) => { encodeRun(pass, this.mergeResidual); encodeRun(pass, this.mergeNormalized); });
       const layer = this.layers[layerIndex];
       stage('qkv', (pass) => this.model.kernelFor(layer.qkv).encode(pass, layer.qkv));
       stage('rope_attention', (pass) => { encodeRun(pass, layer.qkRope); this.model.attention.encode(pass, layer.attention); });
@@ -227,7 +250,7 @@ export class NemotronExecutionPlan {
     const targetLengths = new Uint32Array(this.batch);
     for (let batch = 0; batch < this.batch; batch += 1) {
       const sourceLength = Math.min(this.inputSequence, sequenceLengths[batch]);
-      targetLengths[batch] = Math.min(this.sequence, contextualMergedLength(sourceLength));
+      targetLengths[batch] = Math.min(this.sequence, contextualMergedLength(sourceLength, this.model.executionProfile));
     }
     return targetLengths;
   }
@@ -250,11 +273,16 @@ export class NemotronWebGPUModel {
   readonly tokenMerge: TokenMergeKernel;
   readonly prepackedNames = new Set<string>();
 
-  constructor(readonly device: GPUDevice, source: GGUFModel | PrepackedModel) {
+  constructor(
+    readonly device: GPUDevice,
+    source: GGUFModel | PrepackedModel,
+    readonly executionProfile: ExecutionProfile = 'quality',
+    readonly compactMatmulProfile: CompactMatmulProfile = 'portable',
+  ) {
     this.maxStorageBufferBindingSize = device.limits.maxStorageBufferBindingSize;
     this.q4 = new QuantMatmulKernel(device, GGMLType.Q4_K);
     this.q40 = new QuantMatmulKernel(device, GGMLType.Q4_0);
-    this.q40Prepacked = new QuantMatmulKernel(device, GGMLType.Q4_0, 'q4_0-tile32-compact');
+    this.q40Prepacked = new QuantMatmulKernel(device, GGMLType.Q4_0, 'q4_0-tile32-compact', compactMatmulProfile);
     this.q6 = new QuantMatmulKernel(device, GGMLType.Q6_K);
     this.rmsNorm = new RmsNormKernel(device); this.swiglu = new SwiGLUKernel(device);
     this.rope = new MistralRopeKernel(device); this.attention = new BidirectionalAttentionKernel(device);
@@ -320,9 +348,9 @@ export class NemotronWebGPUModel {
   }
 
   kernelFor(run: QuantMatmulRun): QuantMatmulKernel {
-    if(run.pipeline===this.q40Prepacked.latencyPipeline||run.pipeline===this.q40Prepacked.throughputPipeline||run.pipeline===this.q40Prepacked.midBatchPipeline||run.pipeline===this.q40Prepacked.batchPipeline||run.pipeline===this.q40Prepacked.subgroupPipeline||run.pipeline===this.q40Prepacked.compactSubgroup16Pipeline)return this.q40Prepacked;
-    if(run.pipeline===this.q40.latencyPipeline||run.pipeline===this.q40.throughputPipeline||run.pipeline===this.q40.midBatchPipeline||run.pipeline===this.q40.batchPipeline)return this.q40;
-    return run.pipeline === this.q4.latencyPipeline || run.pipeline === this.q4.throughputPipeline || run.pipeline === this.q4.midBatchPipeline || run.pipeline === this.q4.batchPipeline ? this.q4 : this.q6;
+    if (this.q40Prepacked.ownsPipeline(run.pipeline)) return this.q40Prepacked;
+    if (this.q40.ownsPipeline(run.pipeline)) return this.q40;
+    return this.q4.ownsPipeline(run.pipeline) ? this.q4 : this.q6;
   }
 
   createPlan(batch: number, sequence: number): NemotronExecutionPlan { return new NemotronExecutionPlan(this, batch, sequence); }
