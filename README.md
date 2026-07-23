@@ -27,6 +27,18 @@ All tokens enter the encoder and the first four layers run at the original seque
 
 GPU performance is sensitive to thermals. Run long rows separately and allow the GPU to cool before collecting another row. The complete measurements and methodology are in [`docs/benchmarks/2026-07-17-webgpu-vs-lm-studio-m3-max.json`](docs/benchmarks/2026-07-17-webgpu-vs-lm-studio-m3-max.json).
 
+### Windows RTX 3070 fast-150 profile
+
+The Windows/NVIDIA path has two independent opt-in settings. `kernels=nvidia-rtx30` enables dedicated 32×64, 64×64, and 256×32 compact Q4_0 matmul tiles. `execution=fast-150` changes 128–192-token requests to run one full-context layer and then merge to 32 contextual states. Enable both for the measured maximum-throughput configuration:
+
+```text
+http://127.0.0.1:5173/?matrix=1&tokens=150&kernels=nvidia-rtx30&execution=fast-150&diagnostic=1
+```
+
+On an NVIDIA GeForce RTX 3070 Laptop GPU, the 150-token fixture reached **27.43 req/s** single-stream and **65.66 req/s** at 16 concurrent requests. The paired LM Studio run reached 11.80 and 14.68 req/s, respectively, making WebGPU **132.5% faster** single-stream and **4.47x faster** at 16-way concurrency. LM Studio cosine agreement was `0.9730`, and every native-batch result agreed with the single WebGPU result at `1.000000` cosine.
+
+The default remains `portable + quality`, preserving the published Mac kernel policy and running four layers before merging to 64% of the input length. `nvidia-rtx30 + quality` enables only the NVIDIA kernels without changing model semantics. A 145-token natural-prose check of the default quality profile scored `0.9276` cosine against LM Studio. `fast-150` is intentionally explicit because its earlier, stronger token merge trades natural-prose fidelity for throughput; it is never enabled by adapter detection. Full Windows measurements and methodology are in [`docs/benchmarks/2026-07-22-windows-rtx3070-fast150.json`](docs/benchmarks/2026-07-22-windows-rtx3070-fast150.json).
+
 ## Required model
 
 Normal use requires only this release asset:
@@ -98,6 +110,12 @@ Run a WebGPU row in the browser:
 http://127.0.0.1:5173/?matrix=1&tokens=500
 ```
 
+For the Windows/NVIDIA 150-token throughput profile:
+
+```text
+http://127.0.0.1:5173/?matrix=1&tokens=150&kernels=nvidia-rtx30&execution=fast-150
+```
+
 Run the matching LM Studio conditions:
 
 ```sh
@@ -129,7 +147,7 @@ The format starts with the `WGPACK02` magic value, followed by a JSON tensor ind
 
 ## Portability
 
-The `.wgpack` contains no machine ISA, and the kernels are standard WGSL. The design is GPU-architecture agnostic and should work on NVIDIA and AMD hardware when the browser exposes the required WebGPU features. Performance is not architecture-independent: subgroup behavior, memory limits, drivers, and browser implementations differ. This release has been validated only on Apple M3 Max, 30 core GPU.
+The `.wgpack` contains no machine ISA, and the kernels are standard WGSL. The default `portable` kernel profile is GPU-architecture agnostic and should work on NVIDIA and AMD hardware when the browser exposes the required WebGPU features. Performance is not architecture-independent: subgroup behavior, memory limits, drivers, and browser implementations differ. The optional `nvidia-rtx30` profile is tuned for and validated on an NVIDIA GeForce RTX 3070 Laptop GPU; it is not selected automatically. The portable profile has been validated on Apple M3 Max, 30 core GPU.
 
 ## Development
 
